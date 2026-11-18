@@ -3,7 +3,11 @@
 
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
-ACTION="${1:-install}"
+ACTION="${1:-menu}"
+if (( EUID != 0 )); then
+    echo "请使用 sudo 运行管理脚本" >&2
+    exit 1
+fi
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -262,7 +266,7 @@ function uninstall_all() {
     fi
     sleep 0.5
     show_progress 90 "正在删除配置文件、内核调优与证书目录..."
-    rm -rf /opt/suoha /opt/suoha_quick /etc/suoha_sub_port /var/www/suoha_sub /usr/bin/suoha /etc/sysctl.d/99-suoha-4k.conf
+    rm -rf /opt/suoha /opt/suoha_quick /etc/suoha_sub_port /var/www/suoha_sub /usr/bin/suoha /usr/local/sbin/suoha /etc/sysctl.d/99-suoha-4k.conf
     sysctl --system >/dev/null 2>&1
     show_progress 100 "卸载清理完成！"
     echo -e "\n所有梭哈全协议服务、内核网络调优及订阅文件已彻底清理完成。"
@@ -1078,4 +1082,468 @@ EOF
     echo -e "\n所有配置已保存至 /opt/suoha_quick/v2ray.txt，随时执行 cat /opt/suoha_quick/v2ray.txt 查看。"
 }
 
-quicktunnel_all_in_one
+# Upgrade a running installation without invoking the destructive install path.
+upgrade_provider() (
+    set -eu
+    cd /opt/suoha_quick
+    exec 9>.provider.lock
+    flock -x 9
+    stage=$(mktemp -d .provider.XXXXXXXX)
+    trap 'rm -rf "$stage"' EXIT
+    local web=/var/www/suoha_sub
+    local url pid
+    url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' v2ray.txt)
+    [[ "$url" == http://*/clash.yaml ]] || { echo "Missing subscription URL" >&2; exit 1; }
+    pid=$(cat singbox.pid)
+    [[ "$(readlink "/proc/$pid/exe")" == "$PWD/sing-box" ]]
+    python3 - "$stage" <<'PY'
+import base64
+import hashlib
+import ipaddress
+import json
+import secrets
+import ssl
+import sys
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+
+stage = Path(sys.argv[1])
+config = json.loads(Path('singbox.json').read_text())
+by_tag = {item['tag']: item for item in config['inbounds']}
+tls = by_tag['anytls-in']['tls']
+hy2 = by_tag['hy2-in']
+trojan = by_tag.get('trojan-tls-in')
+if trojan is None:
+    trojan = dict(type='trojan', tag='trojan-tls-in', listen=hy2['listen'],
+                  listen_port=hy2['listen_port'], tls=tls,
+                  users=[dict(password=secrets.token_hex(24))])
+    config['inbounds'].append(trojan)
+    (stage / 'singbox.json').write_text(json.dumps(config, indent=2) + '\n')
+
+# Consume the inline profile on first migration and the saved provider on refresh.
+profile = Path('clash.yaml').read_text()
+if '\nproxy-providers:' in profile:
+    nodes = Path('proxies.yaml').read_text()
+else:
+    nodes = 'proxies:\n' + profile.split('\nproxies:\n', 1)[1].split('\nproxy-groups:', 1)[0]
+links = Path('nodes.txt').read_text().splitlines()
+reality = next(urlsplit(link) for link in links if link.startswith('vless://') and 'security=reality' in link)
+name = reality.fragment.rsplit('-VLESS-Reality-Vision', 1)[0] + '-Trojan-TLS'
+host = reality.hostname
+port = trojan['listen_port']
+password = trojan['users'][0]['password']
+sni = tls['server_name']
+cert = ssl.PEM_cert_to_DER_cert(Path(tls['certificate_path']).read_text())
+fingerprint = hashlib.sha256(cert).hexdigest()
+entry = dict(name=name, type='trojan', server=host, port=port, password=password,
+             sni=sni, fingerprint=fingerprint, udp=True)
+# The added node is a YAML flow mapping on one line.
+entries = [entry]
+if ipaddress.ip_address(host).version == 4:
+    ss = by_tag['ss-ipv6-in']
+    ss_name = name.rsplit('-Trojan-TLS', 1)[0] + '-SS-IPv4'
+    entries.insert(0, dict(name=ss_name, type='ss', server=host,
+                           port=ss['listen_port'], cipher=ss['method'],
+                           password=ss['password'], udp=True))
+    auth = base64.urlsafe_b64encode((ss['method'] + ':' + ss['password']).encode()).decode().rstrip('=')
+    ss_uri = f"ss://{auth}@{host}:{ss['listen_port']}#{quote(ss_name)}"
+    if ss_uri not in links:
+        links.append(ss_uri)
+prefixes = tuple('  - {"name": ' + json.dumps(node['name']) + ',' for node in entries)
+lines = [line for line in nodes.rstrip().splitlines() if not line.startswith(prefixes)]
+lines.extend('  - ' + json.dumps(node) for node in entries)
+(stage / 'proxies.yaml').write_text('\n'.join(lines) + '\n')
+uri_host = '[' + host + ']' if ':' in host else host
+uri = f'trojan://{password}@{uri_host}:{port}?security=tls&sni={sni}&allowInsecure=1#{quote(name)}'
+if uri not in links:
+    links.append(uri)
+raw = ('\n'.join(links) + '\n').encode()
+(stage / 'nodes.txt').write_bytes(raw)
+(stage / 'sub.txt').write_bytes(base64.b64encode(raw))
+PY
+    cat > "$stage/clash.yaml" <<'PROFILE'
+mixed-port: 7890
+allow-lan: false
+bind-address: '127.0.0.1'
+mode: rule
+log-level: info
+ipv6: true
+external-controller: 127.0.0.1:10000
+experimental:
+  ignore-resolve-fail: true
+sniffer:
+  enable: true
+  override-destination: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+      override-destination: true
+    QUIC:
+      ports: [443, 8443]
+      override-destination: true
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip # redir-host / fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "localhost.ptlogin2.qq.com"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+  use-hosts: true
+  # IP literals avoid a separate system DNS lookup for the DoH endpoints.
+  default-nameserver: &public_doh
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  nameserver:
+    - "https://1.1.1.1/dns-query#♻️ 自动选择"
+    - "https://8.8.8.8/dns-query#♻️ 自动选择"
+  proxy-server-nameserver: *public_doh
+  direct-nameserver: *public_doh
+
+######### 锚点 start #######
+# 策略组相关
+p: &p {interval: 3600, health-check: {enable: true, url: https://www.gstatic.com/generate_204, interval: 300}}
+
+# 引入proxy-provider 使用 use 关键字
+u: &u {use: ['suoha']}
+
+######### 锚点 end #######
+
+proxy-providers:
+  # 从本地导入的 clash 配置文件
+  # local:
+  #  <<: *p
+  # type: file
+  #  path: ./profiles/nodes.yaml
+
+  # 从链接导入的配置文件（支持多个Clash 订阅链接）
+  suoha:
+    <<: *p
+    type: http
+    path: ./providers/suoha.yaml
+    url: PROXY_PROVIDERS_URL
+
+proxies:
+
+proxy-groups:
+  - { name: 🚀 节点选择, type: select, proxies: ['♻️ 自动选择',DIRECT], <<: *u }
+  - { name: ♻️ 自动选择, type: url-test, url: http://www.gstatic.com/generate_204, interval: 300, tolerance: 50, proxies: [], <<: *u }
+  - { name: ▶️ YouTube, type: select, proxies: ['🚀 节点选择','♻️ 自动选择'], <<: *u }
+  - { name: 📲 电报信息, type: select, proxies: ['🚀 节点选择'], <<: *u }
+  - { name: 🤖 ChatGPT, type: select, proxies: [], <<: *u, filter: "(?i)^(?!.*(?:🇭🇰|港|hk|hongkong)).*" }
+  - { name: 🛑 全球拦截, type: select, proxies: [REJECT,DIRECT] }
+  - { name: 🐟 漏网之鱼, type: select, proxies: ['🚀 节点选择',DIRECT,'♻️ 自动选择'], <<: *u }
+
+rules:
+  # - AND,(AND,(DST-PORT,443),(NETWORK,UDP)),(GEOSITE,geolocation-!cn),REJECT # quic
+  - GEOSITE,youtube,▶️ YouTube
+  - OR,((DOMAIN,gemini.google.com),(DOMAIN,bard.google.com),(GEOSITE,openai)),🤖 ChatGPT
+  - RULE-SET,applications,DIRECT
+  - DOMAIN,clash.razord.top,DIRECT
+  - DOMAIN,yacd.haishan.me,DIRECT
+  - RULE-SET,private,DIRECT
+  - RULE-SET,reject,🛑 全球拦截
+  - RULE-SET,icloud,🚀 节点选择
+  - RULE-SET,apple,🚀 节点选择
+  - RULE-SET,google,🚀 节点选择
+  - RULE-SET,proxy,🚀 节点选择
+  - RULE-SET,direct,DIRECT
+  - RULE-SET,lancidr,DIRECT
+  - RULE-SET,cncidr,DIRECT
+  - RULE-SET,telegramcidr,📲 电报信息
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🐟 漏网之鱼
+
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
+    path: ./ruleset/reject.yaml
+    interval: 86400
+
+  icloud:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt"
+    path: ./ruleset/icloud.yaml
+    interval: 86400
+
+  apple:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt"
+    path: ./ruleset/apple.yaml
+    interval: 86400
+
+  google:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt"
+    path: ./ruleset/google.yaml
+    interval: 86400
+
+  proxy:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt"
+    path: ./ruleset/proxy.yaml
+    interval: 86400
+
+  direct:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt"
+    path: ./ruleset/direct.yaml
+    interval: 86400
+
+  private:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
+    path: ./ruleset/private.yaml
+    interval: 86400
+
+  gfw:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt"
+    path: ./ruleset/gfw.yaml
+    interval: 86400
+
+  greatfire:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/greatfire.txt"
+    path: ./ruleset/greatfire.yaml
+    interval: 86400
+
+  tld-not-cn:
+    type: http
+    behavior: domain
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/tld-not-cn.txt"
+    path: ./ruleset/tld-not-cn.yaml
+    interval: 86400
+
+  telegramcidr:
+    type: http
+    behavior: ipcidr
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt"
+    path: ./ruleset/telegramcidr.yaml
+    interval: 86400
+
+  cncidr:
+    type: http
+    behavior: ipcidr
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
+    path: ./ruleset/cncidr.yaml
+    interval: 86400
+
+  lancidr:
+    type: http
+    behavior: ipcidr
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
+    path: ./ruleset/lancidr.yaml
+    interval: 86400
+
+  applications:
+    type: http
+    behavior: classical
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+    path: ./ruleset/applications.yaml
+    interval: 86400
+PROFILE
+    sed -i "s|PROXY_PROVIDERS_URL|${url%/*}/proxies.yaml|" "$stage/clash.yaml"
+    if [ -f "$stage/singbox.json" ]; then
+        ./sing-box check -c "$stage/singbox.json"
+        cp -p singbox.json "$stage/previous.json"
+        mv "$stage/singbox.json" singbox.json
+        kill -HUP "$pid"
+        local ready=0 port
+        port=$(python3 -c 'import json; print(next(i["listen_port"] for i in json.load(open("singbox.json"))["inbounds"] if i["tag"]=="trojan-tls-in"))')
+        for _ in {1..25}; do
+            if ss -Hlntp "sport = :$port" | grep -q "pid=$pid,"; then ready=1; break; fi
+            sleep .2
+        done
+        if (( !ready )); then
+            mv "$stage/previous.json" singbox.json
+            if kill -0 "$pid" 2>/dev/null; then kill -HUP "$pid"; else
+                nohup ./sing-box run -c "$PWD/singbox.json" >>singbox.log 2>&1 </dev/null 9>&- &
+                echo $! > singbox.pid
+            fi
+            echo "Trojan listener failed. Restored previous configuration." >&2
+            exit 1
+        fi
+    fi
+    for file in proxies.yaml nodes.txt sub.txt clash.yaml; do
+        install -m 644 "$stage/$file" "$web/.$file.new"
+        mv -f "$web/.$file.new" "$web/$file"
+        mv -f "$stage/$file" "$file"
+    done
+    echo "Clash Verge: $url"
+)
+
+work=/opt/suoha_quick
+web=/var/www/suoha_sub
+
+# Only signal a process when the recorded PID still belongs to this installation.
+managed_pid() {
+    local service=$1 pid binary
+    pid=$(cat "$work/$service.pid" 2>/dev/null) || return 1
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    binary=$(readlink "/proc/$pid/exe") || return 1
+    case "$service" in
+        singbox) [[ $binary == "$work/sing-box" ]] || return 1 ;;
+        snell) [[ $binary == "$work/snell-server" ]] || return 1 ;;
+        cf_main) [[ $binary == "$work/cloudflared-linux" ]] || return 1 ;;
+        argo_router|sub_http)
+            [[ ${binary##*/} == python3* ]] || return 1
+            local arg="$work/argo_router.py"
+            [[ $service != sub_http ]] || arg="$web"
+            tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fxq "$arg" || return 1 ;;
+        *) return 1 ;;
+    esac
+    echo "$pid"
+}
+
+service_status() {
+    local svc pid
+    for svc in singbox sub_http cf_main argo_router snell; do
+        if pid=$(managed_pid "$svc"); then echo "$svc  运行中  PID $pid"
+        else echo "$svc  未运行"; fi
+    done
+    "$work/sing-box" version | head -1
+}
+
+subscriptions() {
+    local url port
+    url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' "$work/v2ray.txt")
+    [[ -n $url ]] || return 1
+    echo "Clash Verge  $url"
+    echo "节点列表    ${url%/*}/proxies.yaml"
+    echo "通用订阅    ${url%/*}/sub.txt"
+    port=$(cat /etc/suoha_sub_port)
+    curl --noproxy '*' -gfsS --max-time 4 "http://[::1]:$port/clash.yaml" -o /dev/null && echo "订阅 HTTP 检查通过"
+}
+
+stop_managed() {
+    local service=$1 pid
+    pid=$(managed_pid "$service") || return 0
+    kill -TERM "$pid" || return 1
+    for _ in {1..50}; do
+        [[ $(managed_pid "$service") == "$pid" ]] || return 0
+        sleep .1
+    done
+    echo "$service 停止超时" >&2
+    return 1
+}
+
+start_managed() {
+    local service=$1 port pid
+    case "$service" in
+        singbox)
+            nohup "$work/sing-box" run -c "$work/singbox.json" >>"$work/singbox.log" 2>&1 </dev/null 9>&- & ;;
+        sub_http)
+            port=$(cat /etc/suoha_sub_port) || return 1
+            nohup python3 -m http.server "$port" --bind :: --directory "$web" >>"$work/sub_http.log" 2>&1 </dev/null 9>&- & ;;
+    esac
+    pid=$!
+    echo "$pid" > "$work/$service.pid"
+    for _ in {1..50}; do
+        kill -0 "$pid" 2>/dev/null || break
+        if ss -Hlntp | grep -F "pid=$pid," >/dev/null; then return 0; fi
+        sleep .1
+    done
+    echo "$service 未成功监听，请检查 $work 下的日志" >&2
+    return 1
+}
+
+manage_runtime() (
+    set -eu
+    cd "$work"
+    exec 9>.provider.lock
+    flock -x 9
+    case "$1" in
+        restart|restart-sub)
+            local service=sub_http
+            if [[ $1 == restart ]]; then
+                service=singbox
+                ./sing-box check -c singbox.json
+            fi
+            stop_managed "$service"
+            start_managed "$service"
+            echo "$service 已启动"
+            return ;;
+    esac
+
+    local arch version current asset digest stage
+    case "$(uname -m)" in
+        x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;;
+        armv7*) arch=armv7 ;; i?86) arch=386 ;; *) return 1 ;;
+    esac
+    stage=$(mktemp -d .update.XXXXXXXX)
+    trap 'rm -rf "$stage"' EXIT
+    curl -fsSL --retry 2 --max-time 60 https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$stage/release"
+    version=$(jq -er '.tag_name | ltrimstr("v")' "$stage/release")
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    current=$(./sing-box version | awk 'NR==1 {print $3}')
+    echo "当前 $current  最新稳定版 $version"
+    [[ $current != "$version" ]] || return 0
+    asset="sing-box-$version-linux-$arch"
+    digest=$(jq -er --arg n "$asset.tar.gz" '.assets[] | select(.name==$n) | .digest | select(type=="string")' "$stage/release")
+    [[ $digest =~ ^sha256:[a-f0-9]{64}$ ]]
+    curl -fsSL --retry 2 --max-time 180 "https://github.com/SagerNet/sing-box/releases/download/v$version/$asset.tar.gz" -o "$stage/archive"
+    echo "${digest#sha256:}  $stage/archive" | sha256sum -c -
+    tar -xzf "$stage/archive" -C "$stage" "$asset/sing-box"
+    "$stage/$asset/sing-box" check -c singbox.json
+    cp -p sing-box "$stage/previous"
+    stop_managed singbox
+    if mv "$stage/$asset/sing-box" sing-box && start_managed singbox; then
+        echo "sing-box 已更新至 $version"
+    else
+        stop_managed singbox
+        mv "$stage/previous" sing-box
+        start_managed singbox
+        echo "升级失败，已恢复 $current" >&2
+        exit 1
+    fi
+)
+
+menu() {
+    local choice
+    while true; do
+        echo "1 状态  2 重启 sing-box  3 更新 sing-box  4 查看订阅  5 重启订阅服务  6 刷新订阅配置  0 退出"
+        read -rp '请选择 > ' choice || return 0
+        case "$choice" in
+            1) service_status ;; 2) manage_runtime restart ;; 3) manage_runtime update ;;
+            4) subscriptions ;; 5) manage_runtime restart-sub ;; 6) upgrade_provider ;;
+            0) return 0 ;; *) echo "请输入 0 至 6" ;;
+        esac
+    done
+}
+
+install_cli() {
+    [[ -f "$0" ]] || { echo '请先下载 suoha.sh，再从文件运行' >&2; return 1; }
+    [[ "$0" -ef /usr/local/sbin/suoha ]] || install -m 755 "$0" /usr/local/sbin/suoha
+}
+
+case "$ACTION" in
+    install) install_cli && quicktunnel_all_in_one && upgrade_provider ;;
+    install-cli) install_cli ;;
+    menu) if [[ -f "$work/singbox.json" ]]; then menu
+          else echo '首次部署请执行 sudo bash suoha.sh install'; fi ;;
+    status) service_status ;;
+    subscriptions) subscriptions ;;
+    restart|restart-sub|update) manage_runtime "$ACTION" ;;
+    upgrade-provider) upgrade_provider ;;
+    *) echo "Usage: suoha [menu|status|subscriptions|restart|restart-sub|update|upgrade-provider|install-cli|install|uninstall]" >&2; exit 2 ;;
+esac

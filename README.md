@@ -50,30 +50,18 @@
 
 ## 一键运行命令
 
-登录 VPS 终端（支持 root 用户），执行以下命令即可启动交互菜单：
+首次安装需要 root 权限。已有部署可只安装菜单，再刷新订阅。安装脚本的 `install` 操作会重新生成端口和凭证。
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/a6216abcd/newsuoha.sh/refs/heads/main/suoha.sh)"
-
+curl -fLo suoha.sh https://raw.githubusercontent.com/howardshaw/newsuoha.sh/main/suoha.sh
+# 首次部署
+sudo bash suoha.sh install
+# 已有部署
+sudo bash suoha.sh install-cli
+sudo suoha upgrade-provider
 ```
 
-如果系统未预装 `curl`，可使用 `wget` 代替：
-
-```bash
-bash -c "$(wget -qO- https://raw.githubusercontent.com/a6216abcd/newsuoha.sh/refs/heads/main/suoha.sh)"
-
-```
-
----
-
-部署完成后，所有内核调优状态、节点链接、Snell 配置及客户端订阅信息均保存在 `/opt/suoha_quick/v2ray.txt`，随时可通过以下命令再次查看：
-
-```bash
-cat /opt/suoha_quick/v2ray.txt
-
-```
-
----
+运行 `sudo suoha` 打开菜单。命令行支持 `status`、`subscriptions`、`restart`（sing-box）、`restart-sub`（订阅 HTTP）和 `update`（官方最新稳定版）。更新会校验发布包 SHA-256 和现有配置，启动失败时恢复旧内核。重启内核会短暂中断代理连接，Argo 隧道继续使用已有域名。
 
 ## 支持协议一览
 
