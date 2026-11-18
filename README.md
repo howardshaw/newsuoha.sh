@@ -61,6 +61,8 @@ sudo bash suoha.sh install-cli
 sudo suoha upgrade-provider
 ```
 
+通过本 fork 执行完整安装的每台服务器都会安装 `/usr/local/sbin/suoha`。仅需二进制时，先执行 `sudo bash suoha.sh install-cli`，再执行 `sudo suoha install-core`。二进制位于 `/opt/suoha_quick/sing-box`，没有服务配置时只安装文件。独立安装需要 Bash、curl、jq、tar、flock 和 sha256sum。
+
 运行 `sudo suoha` 打开菜单。命令行支持 `status`、`subscriptions`、`restart`（sing-box）、`restart-sub`（订阅 HTTP）和 `update`（官方最新稳定版）。更新会校验发布包 SHA-256 和现有配置，启动失败时恢复旧内核。重启内核会短暂中断代理连接，Argo 隧道继续使用已有域名。
 
 ## 支持协议一览

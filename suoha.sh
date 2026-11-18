@@ -293,28 +293,23 @@ function quicktunnel_all_in_one() {
     cd /opt/suoha_quick || exit 1
 
     # 1. 架构识别与核心下载
-    local arch_sb=""
     local arch_cf=""
     local arch_snell=""
 
     case "$(uname -m)" in
         x86_64 | x64 | amd64 )
-            arch_sb="linux-amd64"
             arch_cf="linux-amd64"
             arch_snell="linux-amd64"
             ;;
         i386 | i686 )
-            arch_sb="linux-386"
             arch_cf="linux-386"
             arch_snell="linux-i386"
             ;;
         armv8 | arm64 | aarch64 )
-            arch_sb="linux-arm64"
             arch_cf="linux-arm64"
             arch_snell="linux-aarch64"
             ;;
         armv7l )
-            arch_sb="linux-armv7"
             arch_cf="linux-arm"
             arch_snell="linux-armv7l"
             ;;
@@ -325,17 +320,7 @@ function quicktunnel_all_in_one() {
     esac
 
     show_progress 15 "正在获取官方 Sing-box 稳定版核心..."
-    local sb_version
-    sb_version=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-    if [ -z "$sb_version" ]; then
-        sb_version="1.12.12"
-    fi
-
-    show_progress 22 "正在下载官方 Sing-box v${sb_version} 主力核心..."
-    curl -sL "https://github.com/SagerNet/sing-box/releases/download/v${sb_version}/sing-box-${sb_version}-${arch_sb}.tar.gz" -o sb.tar.gz
-    tar -xzf sb.tar.gz >/dev/null 2>&1
-    mv "sing-box-${sb_version}-${arch_sb}/sing-box" /opt/suoha_quick/sing-box 2>/dev/null
-    rm -rf "sing-box-${sb_version}-${arch_sb}" sb.tar.gz
+    /usr/local/sbin/suoha install-core || return 1
 
     show_progress 34 "正在下载 Cloudflare Argo 隧道组件..."
     curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${arch_cf}" -o /opt/suoha_quick/cloudflared-linux
@@ -1402,7 +1387,7 @@ managed_pid() {
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
     binary=$(readlink "/proc/$pid/exe") || return 1
     case "$service" in
-        singbox) [[ $binary == "$work/sing-box" ]] || return 1 ;;
+        singbox) [[ $binary == "$work/sing-box" || $binary == "$work/sing-box (deleted)" ]] || return 1 ;;
         snell) [[ $binary == "$work/snell-server" ]] || return 1 ;;
         cf_main) [[ $binary == "$work/cloudflared-linux" ]] || return 1 ;;
         argo_router|sub_http)
@@ -1468,7 +1453,8 @@ start_managed() {
 }
 
 manage_runtime() (
-    set -eu
+    set -euo pipefail
+    if [[ $1 == install-core ]]; then mkdir -p "$work"; fi
     cd "$work"
     exec 9>.provider.lock
     flock -x 9
@@ -1487,7 +1473,7 @@ manage_runtime() (
 
     local arch version current asset digest stage
     case "$(uname -m)" in
-        x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;;
+        x86_64|amd64|x64) arch=amd64 ;; aarch64|arm64|armv8) arch=arm64 ;;
         armv7*) arch=armv7 ;; i?86) arch=386 ;; *) return 1 ;;
     esac
     stage=$(mktemp -d .update.XXXXXXXX)
@@ -1495,7 +1481,10 @@ manage_runtime() (
     curl -fsSL --retry 2 --max-time 60 https://api.github.com/repos/SagerNet/sing-box/releases/latest -o "$stage/release"
     version=$(jq -er '.tag_name | ltrimstr("v")' "$stage/release")
     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-    current=$(./sing-box version | awk 'NR==1 {print $3}')
+    current=未安装
+    if [[ -x sing-box ]]; then
+        current=$(./sing-box version | awk 'NR==1 {print $3}')
+    fi
     echo "当前 $current  最新稳定版 $version"
     [[ $current != "$version" ]] || return 0
     asset="sing-box-$version-linux-$arch"
@@ -1503,14 +1492,21 @@ manage_runtime() (
     [[ $digest =~ ^sha256:[a-f0-9]{64}$ ]]
     curl -fsSL --retry 2 --max-time 180 "https://github.com/SagerNet/sing-box/releases/download/v$version/$asset.tar.gz" -o "$stage/archive"
     echo "${digest#sha256:}  $stage/archive" | sha256sum -c -
-    tar -xzf "$stage/archive" -C "$stage" "$asset/sing-box"
+    tar --no-same-owner -xzf "$stage/archive" -C "$stage" "$asset/sing-box"
+    [[ $("$stage/$asset/sing-box" version | awk 'NR==1 {print $3}') == "$version" ]]
+    if [[ ! -f singbox.json ]]; then
+        mv "$stage/$asset/sing-box" sing-box
+        echo "已安装 $PWD/sing-box ($version)"
+        return
+    fi
     "$stage/$asset/sing-box" check -c singbox.json
-    cp -p sing-box "$stage/previous"
+    if [[ -f sing-box ]]; then cp -p sing-box "$stage/previous"; fi
     stop_managed singbox
     if mv "$stage/$asset/sing-box" sing-box && start_managed singbox; then
         echo "sing-box 已更新至 $version"
     else
         stop_managed singbox
+        [[ -f "$stage/previous" ]] || { echo "内核已下载，服务启动失败" >&2; exit 1; }
         mv "$stage/previous" sing-box
         start_managed singbox
         echo "升级失败，已恢复 $current" >&2
@@ -1521,10 +1517,10 @@ manage_runtime() (
 menu() {
     local choice
     while true; do
-        echo "1 状态  2 重启 sing-box  3 更新 sing-box  4 查看订阅  5 重启订阅服务  6 刷新订阅配置  0 退出"
+        echo "1 状态  2 重启 sing-box  3 安装或更新 sing-box  4 查看订阅  5 重启订阅服务  6 刷新订阅配置  0 退出"
         read -rp '请选择 > ' choice || return 0
         case "$choice" in
-            1) service_status ;; 2) manage_runtime restart ;; 3) manage_runtime update ;;
+            1) service_status ;; 2) manage_runtime restart ;; 3) manage_runtime install-core ;;
             4) subscriptions ;; 5) manage_runtime restart-sub ;; 6) upgrade_provider ;;
             0) return 0 ;; *) echo "请输入 0 至 6" ;;
         esac
@@ -1539,11 +1535,11 @@ install_cli() {
 case "$ACTION" in
     install) install_cli && quicktunnel_all_in_one && upgrade_provider ;;
     install-cli) install_cli ;;
-    menu) if [[ -f "$work/singbox.json" ]]; then menu
-          else echo '首次部署请执行 sudo bash suoha.sh install'; fi ;;
+    menu) if [[ -d "$work" ]]; then menu
+          else echo '首次部署请执行 sudo bash suoha.sh install；仅安装内核请执行 sudo bash suoha.sh install-core'; fi ;;
     status) service_status ;;
     subscriptions) subscriptions ;;
-    restart|restart-sub|update) manage_runtime "$ACTION" ;;
+    install-core|restart|restart-sub|update) manage_runtime "$ACTION" ;;
     upgrade-provider) upgrade_provider ;;
-    *) echo "Usage: suoha [menu|status|subscriptions|restart|restart-sub|update|upgrade-provider|install-cli|install|uninstall]" >&2; exit 2 ;;
+    *) echo "Usage: suoha [menu|status|subscriptions|restart|restart-sub|install-core|update|upgrade-provider|install-cli|install|uninstall]" >&2; exit 2 ;;
 esac
