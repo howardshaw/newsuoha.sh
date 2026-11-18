@@ -1068,84 +1068,9 @@ EOF
 }
 
 # Upgrade a running installation without invoking the destructive install path.
-upgrade_provider() (
+render_provider_profile() (
     set -eu
-    cd /opt/suoha_quick
-    exec 9>.provider.lock
-    flock -x 9
-    stage=$(mktemp -d .provider.XXXXXXXX)
-    trap 'rm -rf "$stage"' EXIT
-    local web=/var/www/suoha_sub
-    local url pid
-    url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' v2ray.txt)
-    [[ "$url" == http://*/clash.yaml ]] || { echo "Missing subscription URL" >&2; exit 1; }
-    pid=$(cat singbox.pid)
-    [[ "$(readlink "/proc/$pid/exe")" == "$PWD/sing-box" ]]
-    python3 - "$stage" <<'PY'
-import base64
-import hashlib
-import ipaddress
-import json
-import secrets
-import ssl
-import sys
-from pathlib import Path
-from urllib.parse import quote, urlsplit
-
-stage = Path(sys.argv[1])
-config = json.loads(Path('singbox.json').read_text())
-by_tag = {item['tag']: item for item in config['inbounds']}
-tls = by_tag['anytls-in']['tls']
-hy2 = by_tag['hy2-in']
-trojan = by_tag.get('trojan-tls-in')
-if trojan is None:
-    trojan = dict(type='trojan', tag='trojan-tls-in', listen=hy2['listen'],
-                  listen_port=hy2['listen_port'], tls=tls,
-                  users=[dict(password=secrets.token_hex(24))])
-    config['inbounds'].append(trojan)
-    (stage / 'singbox.json').write_text(json.dumps(config, indent=2) + '\n')
-
-# Consume the inline profile on first migration and the saved provider on refresh.
-profile = Path('clash.yaml').read_text()
-if '\nproxy-providers:' in profile:
-    nodes = Path('proxies.yaml').read_text()
-else:
-    nodes = 'proxies:\n' + profile.split('\nproxies:\n', 1)[1].split('\nproxy-groups:', 1)[0]
-links = Path('nodes.txt').read_text().splitlines()
-reality = next(urlsplit(link) for link in links if link.startswith('vless://') and 'security=reality' in link)
-name = reality.fragment.rsplit('-VLESS-Reality-Vision', 1)[0] + '-Trojan-TLS'
-host = reality.hostname
-port = trojan['listen_port']
-password = trojan['users'][0]['password']
-sni = tls['server_name']
-cert = ssl.PEM_cert_to_DER_cert(Path(tls['certificate_path']).read_text())
-fingerprint = hashlib.sha256(cert).hexdigest()
-entry = dict(name=name, type='trojan', server=host, port=port, password=password,
-             sni=sni, fingerprint=fingerprint, udp=True)
-# The added node is a YAML flow mapping on one line.
-entries = [entry]
-if ipaddress.ip_address(host).version == 4:
-    ss = by_tag['ss-ipv6-in']
-    ss_name = name.rsplit('-Trojan-TLS', 1)[0] + '-SS-IPv4'
-    entries.insert(0, dict(name=ss_name, type='ss', server=host,
-                           port=ss['listen_port'], cipher=ss['method'],
-                           password=ss['password'], udp=True))
-    auth = base64.urlsafe_b64encode((ss['method'] + ':' + ss['password']).encode()).decode().rstrip('=')
-    ss_uri = f"ss://{auth}@{host}:{ss['listen_port']}#{quote(ss_name)}"
-    if ss_uri not in links:
-        links.append(ss_uri)
-prefixes = tuple('  - {"name": ' + json.dumps(node['name']) + ',' for node in entries)
-lines = [line for line in nodes.rstrip().splitlines() if not line.startswith(prefixes)]
-lines.extend('  - ' + json.dumps(node) for node in entries)
-(stage / 'proxies.yaml').write_text('\n'.join(lines) + '\n')
-uri_host = '[' + host + ']' if ':' in host else host
-uri = f'trojan://{password}@{uri_host}:{port}?security=tls&sni={sni}&allowInsecure=1#{quote(name)}'
-if uri not in links:
-    links.append(uri)
-raw = ('\n'.join(links) + '\n').encode()
-(stage / 'nodes.txt').write_bytes(raw)
-(stage / 'sub.txt').write_bytes(base64.b64encode(raw))
-PY
+    local stage=$1 base=$2 filename=$3
     cat > "$stage/clash.yaml" <<'PROFILE'
 mixed-port: 7890
 allow-lan: false
@@ -1187,15 +1112,15 @@ dns:
   default-nameserver: &public_doh
     - https://8.8.8.8/dns-query
     - https://1.1.1.1/dns-query
-  nameserver:
-    - "https://1.1.1.1/dns-query#♻️ 自动选择"
-    - "https://8.8.8.8/dns-query#♻️ 自动选择"
-  proxy-server-nameserver: *public_doh
-  direct-nameserver: *public_doh
+  nameserver: &node_doh
+    - "https://1.1.1.1/dns-query#DNS-Reality"
+    - "https://8.8.8.8/dns-query#DNS-Reality"
+  proxy-server-nameserver: *node_doh
+  direct-nameserver: *node_doh
 
 ######### 锚点 start #######
 # 策略组相关
-p: &p {interval: 3600, health-check: {enable: true, url: https://www.gstatic.com/generate_204, interval: 300}}
+p: &p {interval: 3600, health-check: {enable: true, timeout: 15000, url: https://www.gstatic.com/generate_204, interval: 300}}
 
 # 引入proxy-provider 使用 use 关键字
 u: &u {use: ['suoha']}
@@ -1213,7 +1138,8 @@ proxy-providers:
   suoha:
     <<: *p
     type: http
-    path: ./providers/suoha.yaml
+    proxy: DIRECT
+    path: ./providers/PROVIDER_CACHE.yaml
     url: PROXY_PROVIDERS_URL
 
 proxies:
@@ -1347,7 +1273,134 @@ rule-providers:
     path: ./ruleset/applications.yaml
     interval: 86400
 PROFILE
-    sed -i "s|PROXY_PROVIDERS_URL|${url%/*}/proxies.yaml|" "$stage/clash.yaml"
+    python3 - "$stage" "$base" "$filename" <<'PYRENDER'
+from pathlib import Path
+from hashlib import sha256
+from ipaddress import ip_address
+import re
+import sys
+
+stage = Path(sys.argv[1])
+url = sys.argv[2] + '/' + sys.argv[3]
+nodes = (stage / 'proxies.yaml').read_text()
+blocks = re.split(r'(?m)(?=^  - )', nodes)
+vision = next(block for block in blocks if block.startswith('  - name:') and
+              block.splitlines()[0].rstrip('"').endswith('-VLESS-Reality-Vision'))
+ip_address(re.search(r'(?m)^    server: (.+)$', vision)[1].strip().strip('"'))
+bootstrap = '  - name: DNS-Reality\n' + vision.split('\n', 1)[1].rstrip()
+profile = stage / 'clash.yaml'
+text = profile.read_text()
+servers = re.findall(r'(?m)^    server: (.+)$', nodes)
+if not any(':' in host for host in servers):
+    text = text.replace('\nipv6: true\n', '\nipv6: false\n', 1)
+profile.write_text(text.replace('PROXY_PROVIDERS_URL', url)
+                   .replace('PROVIDER_CACHE', 'suoha-' + sha256((url + nodes).encode()).hexdigest()[:16])
+                   .replace('\nproxies:\n', '\nproxies:\n' + bootstrap + '\n', 1))
+PYRENDER
+)
+
+publish_provider() (
+    set -eu
+    cd "$work"
+    exec 9>.provider.lock
+    flock -x 9
+    local stage url
+    stage=$(mktemp -d .publish.XXXXXXXX)
+    trap 'rm -rf "$stage"' EXIT
+    url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' v2ray.txt)
+    [[ -n "$url" ]]
+    if grep -q '^proxy-providers:' "$web/clash.yaml"; then
+        cp "$web/proxies.yaml" "$stage/proxies.yaml"
+    else
+        awk '/^proxies:$/ {copy=1} /^proxy-groups:$/ {copy=0} copy' "$web/clash.yaml" > "$stage/proxies.yaml"
+    fi
+    render_provider_profile "$stage" "${url%/*}" argo-nodes.yaml
+    for pair in proxies.yaml:argo-nodes.yaml clash.yaml:clash-provider.yaml; do
+        install -m644 "$stage/${pair%:*}" "$web/.${pair#*:}.new"
+        mv "$web/.${pair#*:}.new" "$web/${pair#*:}"
+    done
+    echo "${url%/*}/clash-provider.yaml"
+)
+
+upgrade_provider() (
+    set -eu
+    cd /opt/suoha_quick
+    exec 9>.provider.lock
+    flock -x 9
+    stage=$(mktemp -d .provider.XXXXXXXX)
+    trap 'rm -rf "$stage"' EXIT
+    local web=/var/www/suoha_sub
+    local url pid
+    url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' v2ray.txt)
+    [[ "$url" == http://*/clash.yaml ]] || { echo "Missing subscription URL" >&2; exit 1; }
+    pid=$(cat singbox.pid)
+    [[ "$(readlink "/proc/$pid/exe")" == "$PWD/sing-box" ]]
+    python3 - "$stage" <<'PY'
+import base64
+import hashlib
+import ipaddress
+import json
+import secrets
+import ssl
+import sys
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+
+stage = Path(sys.argv[1])
+config = json.loads(Path('singbox.json').read_text())
+by_tag = {item['tag']: item for item in config['inbounds']}
+tls = by_tag['anytls-in']['tls']
+hy2 = by_tag['hy2-in']
+trojan = by_tag.get('trojan-tls-in')
+if trojan is None:
+    trojan = dict(type='trojan', tag='trojan-tls-in', listen=hy2['listen'],
+                  listen_port=hy2['listen_port'], tls=tls,
+                  users=[dict(password=secrets.token_hex(24))])
+    config['inbounds'].append(trojan)
+    (stage / 'singbox.json').write_text(json.dumps(config, indent=2) + '\n')
+
+# Consume the inline profile on first migration and the saved provider on refresh.
+profile = Path('clash.yaml').read_text()
+if '\nproxy-providers:' in profile:
+    nodes = Path('proxies.yaml').read_text()
+else:
+    nodes = 'proxies:\n' + profile.split('\nproxies:\n', 1)[1].split('\nproxy-groups:', 1)[0]
+links = Path('nodes.txt').read_text().splitlines()
+reality = next(urlsplit(link) for link in links if link.startswith('vless://') and 'security=reality' in link)
+name = reality.fragment.rsplit('-VLESS-Reality-Vision', 1)[0] + '-Trojan-TLS'
+host = reality.hostname
+port = trojan['listen_port']
+password = trojan['users'][0]['password']
+sni = tls['server_name']
+cert = ssl.PEM_cert_to_DER_cert(Path(tls['certificate_path']).read_text())
+fingerprint = hashlib.sha256(cert).hexdigest()
+entry = dict(name=name, type='trojan', server=host, port=port, password=password,
+             sni=sni, fingerprint=fingerprint, udp=True)
+# The added node is a YAML flow mapping on one line.
+entries = [entry]
+if ipaddress.ip_address(host).version == 4:
+    ss = by_tag['ss-ipv6-in']
+    ss_name = name.rsplit('-Trojan-TLS', 1)[0] + '-SS-IPv4'
+    entries.insert(0, dict(name=ss_name, type='ss', server=host,
+                           port=ss['listen_port'], cipher=ss['method'],
+                           password=ss['password'], udp=True))
+    auth = base64.urlsafe_b64encode((ss['method'] + ':' + ss['password']).encode()).decode().rstrip('=')
+    ss_uri = f"ss://{auth}@{host}:{ss['listen_port']}#{quote(ss_name)}"
+    if ss_uri not in links:
+        links.append(ss_uri)
+prefixes = tuple('  - {"name": ' + json.dumps(node['name']) + ',' for node in entries)
+lines = [line for line in nodes.rstrip().splitlines() if not line.startswith(prefixes)]
+lines.extend('  - ' + json.dumps(node) for node in entries)
+(stage / 'proxies.yaml').write_text('\n'.join(lines) + '\n')
+uri_host = '[' + host + ']' if ':' in host else host
+uri = f'trojan://{password}@{uri_host}:{port}?security=tls&sni={sni}&allowInsecure=1#{quote(name)}'
+if uri not in links:
+    links.append(uri)
+raw = ('\n'.join(links) + '\n').encode()
+(stage / 'nodes.txt').write_bytes(raw)
+(stage / 'sub.txt').write_bytes(base64.b64encode(raw))
+PY
+    render_provider_profile "$stage" "${url%/*}" proxies.yaml
     if [ -f "$stage/singbox.json" ]; then
         ./sing-box check -c "$stage/singbox.json"
         cp -p singbox.json "$stage/previous.json"
@@ -1414,7 +1467,8 @@ subscriptions() {
     url=$(awk '/^http:\/\/.*\/clash\.yaml$/ {print; exit}' "$work/v2ray.txt")
     [[ -n $url ]] || return 1
     echo "Clash Verge  $url"
-    echo "节点列表    ${url%/*}/proxies.yaml"
+    if [[ -f "$web/clash-provider.yaml" ]]; then echo "独立分流    ${url%/*}/clash-provider.yaml"; fi
+    if [[ -f "$web/proxies.yaml" ]]; then echo "节点列表    ${url%/*}/proxies.yaml"; fi
     echo "通用订阅    ${url%/*}/sub.txt"
     port=$(cat /etc/suoha_sub_port)
     curl --noproxy '*' -gfsS --max-time 4 "http://[::1]:$port/clash.yaml" -o /dev/null && echo "订阅 HTTP 检查通过"
@@ -1517,12 +1571,12 @@ manage_runtime() (
 menu() {
     local choice
     while true; do
-        echo "1 状态  2 重启 sing-box  3 安装或更新 sing-box  4 查看订阅  5 重启订阅服务  6 刷新订阅配置  0 退出"
+        echo "1 状态  2 重启 sing-box  3 安装或更新 sing-box  4 查看订阅  5 重启订阅服务  6 刷新订阅配置  7 发布独立分流订阅  0 退出"
         read -rp '请选择 > ' choice || return 0
         case "$choice" in
             1) service_status ;; 2) manage_runtime restart ;; 3) manage_runtime install-core ;;
             4) subscriptions ;; 5) manage_runtime restart-sub ;; 6) upgrade_provider ;;
-            0) return 0 ;; *) echo "请输入 0 至 6" ;;
+            7) publish_provider ;; 0) return 0 ;; *) echo "请输入 0 至 7" ;;
         esac
     done
 }
@@ -1534,6 +1588,7 @@ install_cli() {
 
 case "$ACTION" in
     install) install_cli && quicktunnel_all_in_one && upgrade_provider ;;
+    publish-provider) publish_provider ;;
     install-cli) install_cli ;;
     menu) if [[ -d "$work" ]]; then menu
           else echo '首次部署请执行 sudo bash suoha.sh install；仅安装内核请执行 sudo bash suoha.sh install-core'; fi ;;
@@ -1541,5 +1596,5 @@ case "$ACTION" in
     subscriptions) subscriptions ;;
     install-core|restart|restart-sub|update) manage_runtime "$ACTION" ;;
     upgrade-provider) upgrade_provider ;;
-    *) echo "Usage: suoha [menu|status|subscriptions|restart|restart-sub|install-core|update|upgrade-provider|install-cli|install|uninstall]" >&2; exit 2 ;;
+    *) echo "Usage: suoha [menu|status|subscriptions|restart|restart-sub|install-core|update|publish-provider|upgrade-provider|install-cli|install|uninstall]" >&2; exit 2 ;;
 esac

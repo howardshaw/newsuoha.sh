@@ -65,6 +65,8 @@ sudo suoha upgrade-provider
 
 运行 `sudo suoha` 打开菜单。命令行支持 `status`、`subscriptions`、`restart`（sing-box）、`restart-sub`（订阅 HTTP）和 `update`（官方最新稳定版）。更新会校验发布包 SHA-256 和现有配置，启动失败时恢复旧内核。重启内核会短暂中断代理连接，Argo 隧道继续使用已有域名。
 
+已有可用的原版订阅时，运行 `sudo suoha publish-provider`（菜单 7）可单独发布 `clash-provider.yaml`。节点来自当前订阅，原版 `clash.yaml` 保持可用。服务器重装或更换临时隧道后应重新发布，并刷新客户端主订阅。
+
 ## 支持协议一览
 
 | 协议类型 | 传输层 / 伪装特性 | 适用场景 |
